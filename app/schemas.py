@@ -63,6 +63,20 @@ class AbsentStudent(BaseModel):
     name: str
 
 
+class ReassignRequest(BaseModel):
+    room_ids: list[str] = Field(
+        ..., min_length=1, description="重设后该学员可去的一个或多个考场"
+    )
+
+
+class ReassignResponse(BaseModel):
+    session_id: str
+    student_id: str
+    room_ids: list[str] = Field(..., description="重设后的可去考场")
+    absent_before: bool = Field(..., description="改派前该学员是否缺考")
+    absent_after: bool = Field(..., description="改派后该学员是否缺考")
+
+
 class AbsentListResponse(BaseModel):
     session_id: str
     absent_students: list[AbsentStudent]

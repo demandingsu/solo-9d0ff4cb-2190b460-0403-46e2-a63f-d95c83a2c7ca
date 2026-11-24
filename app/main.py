@@ -2,6 +2,7 @@
 
 接口：
 - POST /admin/sessions          按期预登记学员与可去考场
+- PUT  /sessions/{id}/students/{sid}/rooms  按期号+学员号重设可去考场（改派）
 - POST /rosters/batches         一批多场交册（空册也算已交），返回收据
 - GET  /rosters/batches/{id}    按批号取回原回执
 - GET  /sessions/{id}/absences  查本期缺考名单
@@ -21,6 +22,8 @@ from .schemas import (
     AbsentListResponse,
     Receipt,
     RegisterRequest,
+    ReassignRequest,
+    ReassignResponse,
     RoomStatusResponse,
     SubmitRostersRequest,
 )
@@ -34,8 +37,8 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="补考缺考核定 API",
-    description="按期预登记学员/考场，按批交签到册，自动核定缺考名单。",
-    version="1.0.0",
+    description="按期预登记学员/考场，按批交签到册，支持改派，自动核定缺考名单。",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -64,6 +67,16 @@ def health() -> dict[str, str]:
 @app.post("/admin/sessions", status_code=201)
 def register_session(payload: RegisterRequest) -> dict:
     return service.register_session(payload.model_dump())
+
+
+@app.put(
+    "/sessions/{session_id}/students/{student_id}/rooms",
+    response_model=ReassignResponse,
+)
+def reassign_student(
+    session_id: str, student_id: str, payload: ReassignRequest
+) -> dict:
+    return service.reassign_student(session_id, student_id, payload.room_ids)
 
 
 @app.post("/rosters/batches", response_model=Receipt)

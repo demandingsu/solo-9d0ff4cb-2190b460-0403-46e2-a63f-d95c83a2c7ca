@@ -8,6 +8,9 @@
 5. 拒收：版号未高于已交版号、列了不能去该场的学员、同批号换内容
 6. 幂等：同批号原样再交取回原回执
 7. 缺考名单查询、交册状态查询
+8. 改派：移出原场后原场现行签到仍算到考；换册保留上一版签到
+9. 改派后删去、未恢复资格补入整批拒收，恢复资格后可补入
+10. 旧回执可查、原样重交返回当时回执；改派与交册并行
 """
 from __future__ import annotations
 
@@ -185,6 +188,167 @@ def main() -> None:
         "rosters": [{"room_id": "A", "version": 9, "student_ids": []}]},
         expect_error="batch_id_conflict")
     ok("同批号换内容被拒收")
+
+    # ---------- 8. 改派 ----------
+    SID2 = SID + "-reassign"
+    call("POST", "/admin/sessions", {
+        "session_id": SID2,
+        "name": "改派测试期",
+        "rooms": [{"room_id": "A"}, {"room_id": "B"}, {"room_id": "C"}],
+        "students": [
+            {"student_id": "u1", "room_ids": ["A", "B"]},
+            {"student_id": "u2", "room_ids": ["A"]},
+            {"student_id": "u3", "room_ids": ["B"]},
+            {"student_id": "u4", "room_ids": ["A"]},
+        ],
+    })
+    ok("改派测试期预登记成功")
+    call("POST", "/rosters/batches", {
+        "batch_id": "RA-1", "session_id": SID2,
+        "rosters": [
+            {"room_id": "A", "version": 1, "student_ids": ["u1", "u2"]},
+            {"room_id": "B", "version": 1, "student_ids": ["u1", "u3"]},
+        ]})
+    ok("两场先行交册")
+
+    # u1 由 A/B 改派为仅 B：原 A 场现行签到仍算到考
+    r = call("PUT", f"/sessions/{SID2}/students/u1/rooms",
+             {"room_ids": ["B"]})
+    check(r["room_ids"] == ["B"] and r["absent_before"] is False
+          and r["absent_after"] is False,
+          "改派 u1 至 B，仍因原 A 场现行签到在册而不缺考")
+
+    # 换册保留上一版已有签到：u1 已不能去 A，但上一版 A 册有 u1
+    r = call("POST", "/rosters/batches", {
+        "batch_id": "RA-2", "session_id": SID2,
+        "rosters": [{"room_id": "A", "version": 2,
+                     "student_ids": ["u1", "u2"]}]})
+    check(r["status"] == "accepted",
+          "换册保留上一版已有的 u1 签到（虽已改派离开 A）")
+    r = call("POST", "/rosters/batches", {
+        "batch_id": "RA-3", "session_id": SID2,
+        "rosters": [{"room_id": "A", "version": 3,
+                     "student_ids": ["u2"]}]})
+    check(r["removed_absent"] == [] and r["added_absent"] == [],
+          "A 场删去 u1 后，u1 仍在 B 场现行签到中，不算缺考")
+    check("u1" not in [x["student_id"] for x in
+                       call("GET", f"/sessions/{SID2}/absences")
+                       ["absent_students"]],
+          "u1 不在缺考名单")
+
+    # u2 由 A 改派为 B：A 现行签到仍算到考
+    r = call("PUT", f"/sessions/{SID2}/students/u2/rooms",
+             {"room_ids": ["B"]})
+    check(r["absent_after"] is False,
+          "改派 u2 至 B，原 A 场现行签到仍算到考")
+    r = call("POST", "/rosters/batches", {
+        "batch_id": "RA-4", "session_id": SID2,
+        "rosters": [{"room_id": "A", "version": 4, "student_ids": []}]})
+    check(r["added_absent"] == ["u2"],
+          "A 场空册删去 u2 后列为缺考（交册重核到原场在册的改派学员）")
+
+    # 删去后未恢复资格就补入 -> 整批拒收
+    call("POST", "/rosters/batches", {
+        "batch_id": "RA-BAD", "session_id": SID2,
+        "rosters": [{"room_id": "A", "version": 5,
+                     "student_ids": ["u2"]}]},
+        expect_error="student_not_allowed")
+    rooms = call("GET", f"/sessions/{SID2}/rooms")["rooms"]
+    a_room = next(x for x in rooms if x["room_id"] == "A")
+    check(a_room["version"] == 4 and a_room["present_count"] == 0,
+          "未恢复 A 场资格补入 u2 整批拒收，A 场仍停留 v4 空册")
+    check("u2" in [x["student_id"] for x in
+                   call("GET", f"/sessions/{SID2}/absences")
+                   ["absent_students"]],
+          "被拒批次未写入，u2 仍为缺考")
+    call("GET", "/rosters/batches/RA-BAD", expect_error="receipt_not_found")
+    ok("被拒批次未落回执")
+
+    # 同批多场：一场合法、一场非法补入 -> 整批原子拒收
+    call("POST", "/rosters/batches", {
+        "batch_id": "RA-BAD-MULTI", "session_id": SID2,
+        "rosters": [
+            {"room_id": "B", "version": 3, "student_ids": ["u3"]},
+            {"room_id": "A", "version": 6, "student_ids": ["u3"]},
+        ]}, expect_error="student_not_allowed")
+    rooms = call("GET", f"/sessions/{SID2}/rooms")["rooms"]
+    b_room = next(x for x in rooms if x["room_id"] == "B")
+    check(b_room["version"] == 1,
+          "同批另一场合法签到也未生效（整批不写入），B 仍停留 v1")
+
+    # 改派到尚未交册的 C：暂不列缺考；C 交册后才列为缺考
+    r = call("PUT", f"/sessions/{SID2}/students/u4/rooms",
+             {"room_ids": ["C"]})
+    check(r["absent_before"] is True and r["absent_after"] is False,
+          "u4 改派到未交册的 C：暂不列缺考")
+    r = call("POST", "/rosters/batches", {
+        "batch_id": "RA-C1", "session_id": SID2,
+        "rosters": [{"room_id": "C", "version": 1, "student_ids": []}]})
+    check(r["added_absent"] == ["u4"],
+          "C 场交空册后 u4 列为缺考（重核回到可去本场的学员）")
+
+    # 恢复资格后补入 -> 接收，缺考净减
+    r = call("PUT", f"/sessions/{SID2}/students/u2/rooms",
+             {"room_ids": ["A"]})
+    check(r["absent_before"] is True and r["absent_after"] is True,
+          "恢复 u2 的 A 场资格：A 场已交空册，仍暂列缺考")
+    r = call("POST", "/rosters/batches", {
+        "batch_id": "RA-5", "session_id": SID2,
+        "rosters": [{"room_id": "A", "version": 5,
+                     "student_ids": ["u2"]}]})
+    check(r["removed_absent"] == ["u2"],
+          "恢复资格后补入 u2 被接收，缺考净减")
+
+    # 改派校验失败保留原状态
+    call("PUT", f"/sessions/{SID2}/students/u3/rooms",
+         {"room_ids": ["A", "Z"]}, expect_error="unknown_room")
+    call("PUT", f"/sessions/{SID2}/students/nobody/rooms",
+         {"room_ids": ["A"]}, expect_error="student_not_found")
+    call("PUT", f"/sessions/{SID2}/students/u3/rooms",
+         {"room_ids": []}, expect_error="validation_error")
+    call("POST", "/rosters/batches", {
+        "batch_id": "RA-BAD2", "session_id": SID2,
+        "rosters": [{"room_id": "A", "version": 6,
+                     "student_ids": ["u3"]}]},
+        expect_error="student_not_allowed")
+    ok("改派失败（未知考场/未知学员/空列表）保留 u3 原有 B 场资格")
+
+    # ---------- 9. 旧回执可查、原样重交 ----------
+    original = call("GET", "/rosters/batches/B-FIX")
+    resent = call("POST", "/rosters/batches", {
+        "batch_id": "B-FIX", "session_id": SID,
+        "rosters": [
+            {"room_id": "A", "version": 2, "student_ids": ["s1"]},
+            {"room_id": "B", "version": 3,
+             "student_ids": ["s1", "s3", "s4"]},
+        ]})
+    check(resent == original,
+          "旧批号回执继续可查，原样重交返回当时的回执")
+    check(call("GET", "/rosters/batches/B-FIX")["status"] == "accepted",
+          "改派后历史交册回执仍原样可查")
+
+    # ---------- 10. 改派与交册并行 ----------
+    def reassign_u3():
+        return call("PUT", f"/sessions/{SID2}/students/u3/rooms",
+                    {"room_ids": ["A"]})
+
+    def submit_b_empty():
+        return call("POST", "/rosters/batches", {
+            "batch_id": "RA-6", "session_id": SID2,
+            "rosters": [{"room_id": "B", "version": 2,
+                         "student_ids": []}]})
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f1 = pool.submit(reassign_u3)
+        f2 = pool.submit(submit_b_empty)
+        r_reassign, r_submit = f1.result(), f2.result()
+    check(r_reassign["room_ids"] == ["A"]
+          and r_submit["status"] == "accepted",
+          "改派与交册并行均被接收（按各自生效先后串行处理）")
+    absent = [x["student_id"] for x in
+              call("GET", f"/sessions/{SID2}/absences")["absent_students"]]
+    check("u3" in absent,
+          "并行后 u3 已离开 B（B 空册）且 A 最新版无他，列为缺考")
 
     print(f"\n全部通过：{passed} 项断言，失败：{failed} 项")
 

@@ -1,4 +1,4 @@
-"""核心业务逻辑：预登记、交册核定、缺考名单计算。"""
+"""核心业务逻辑：预登记、改派、交册核定、缺考名单计算。"""
 from __future__ import annotations
 
 import hashlib
@@ -102,7 +102,13 @@ def register_session(payload: dict[str, Any]) -> dict[str, Any]:
 # ---------- 缺考判定 ----------
 
 def is_absent(conn: sqlite3.Connection, session_id: str, student_id: str) -> bool:
-    """可去的考场全部已交册，且各场最新版都没有该学员。"""
+    """只有同时满足以下两点才列为缺考：
+
+    1. 该学员“现行可去”的考场全部已交册；
+    2. 本期任何一场的现行签到册里都没有该学员。
+
+    第 2 点让学员被改派、移出原场后，原场现行签到册中的在册记录仍然算到考。
+    """
     allowed = conn.execute(
         "SELECT room_id FROM student_room"
         " WHERE session_id=? AND student_id=?",
@@ -117,15 +123,98 @@ def is_absent(conn: sqlite3.Connection, session_id: str, student_id: str) -> boo
             (session_id, room_id),
         ).fetchone()
         if roster is None:
-            return False  # 还有考场没交册，暂不列为缺考
-        present = conn.execute(
-            "SELECT 1 FROM roster_entry"
-            " WHERE session_id=? AND room_id=? AND student_id=?",
-            (session_id, room_id, student_id),
+            return False  # 还有可去考场没交册，暂不列为缺考
+    present_anywhere = conn.execute(
+        "SELECT 1 FROM roster_entry"
+        " WHERE session_id=? AND student_id=? LIMIT 1",
+        (session_id, student_id),
+    ).fetchone()
+    return present_anywhere is None
+
+
+# ---------- 改派（重设单个学员的可去考场） ----------
+
+def reassign_student(
+    session_id: str, student_id: str, room_ids: list[str]
+) -> dict[str, Any]:
+    """按期号、学员号重设该学员当前可去的考场（至少一场）。
+
+    整个改派只重核该学员一人的缺考状态；与交册在同一写事务串行执行，
+    任何校验失败都会回滚，学员原可去考场保持不变。
+    """
+    if not room_ids:
+        raise ApiError(
+            422, "no_allowed_room", "改派至少要选择本期一个考场"
+        )
+    if len(set(room_ids)) != len(room_ids):
+        raise ApiError(
+            422, "duplicate_allowed_room", "改派的可去考场重复"
+        )
+
+    with write_transaction() as conn:
+        session = conn.execute(
+            "SELECT 1 FROM session WHERE id=?", (session_id,)
         ).fetchone()
-        if present is not None:
-            return False  # 任一考场最新版有他，就不是缺考
-    return True
+        if session is None:
+            raise ApiError(
+                404, "session_not_found", f"期 {session_id} 不存在"
+            )
+        student = conn.execute(
+            "SELECT 1 FROM student WHERE session_id=? AND id=?",
+            (session_id, student_id),
+        ).fetchone()
+        if student is None:
+            raise ApiError(
+                404, "student_not_found",
+                f"学员 {student_id} 不在期 {session_id}",
+            )
+        valid_rooms = {
+            row["room_id"]
+            for row in conn.execute(
+                "SELECT room_id FROM room WHERE session_id=?", (session_id,)
+            ).fetchall()
+        }
+        for room_id in room_ids:
+            if room_id not in valid_rooms:
+                raise ApiError(
+                    422, "unknown_room",
+                    f"考场 {room_id} 不属于期 {session_id}",
+                )
+
+        absent_before = is_absent(conn, session_id, student_id)
+
+        conn.execute(
+            "DELETE FROM student_room WHERE session_id=? AND student_id=?",
+            (session_id, student_id),
+        )
+        for room_id in room_ids:
+            conn.execute(
+                "INSERT INTO student_room(session_id, student_id, room_id)"
+                " VALUES(?, ?, ?)",
+                (session_id, student_id, room_id),
+            )
+
+        absent_after = is_absent(conn, session_id, student_id)
+        if absent_after:
+            conn.execute(
+                "INSERT INTO absent_student(session_id, student_id)"
+                " VALUES(?, ?) ON CONFLICT(session_id, student_id) DO NOTHING",
+                (session_id, student_id),
+            )
+        else:
+            conn.execute(
+                "DELETE FROM absent_student"
+                " WHERE session_id=? AND student_id=?",
+                (session_id, student_id),
+            )
+
+        return {
+            "session_id": session_id,
+            "student_id": student_id,
+            "room_ids": list(room_ids),
+            "absent_before": absent_before,
+            "absent_after": absent_after,
+        }
 
 
 # ---------- 交册 ----------
@@ -213,18 +302,32 @@ def submit_rosters(payload: dict[str, Any]) -> dict[str, Any]:
                     " WHERE session_id=? AND student_id=? AND room_id=?",
                     (session_id, sid, room_id),
                 ).fetchone()
-                if allowed is None:
+                if allowed is not None:
+                    continue
+                # 换册时允许保留上一版已有的签到（即使学员已改派离开该场）；
+                # 一旦上一版已删去该学员，未恢复资格就补入则整批拒收。
+                carried_over = conn.execute(
+                    "SELECT 1 FROM roster_entry"
+                    " WHERE session_id=? AND room_id=? AND student_id=?",
+                    (session_id, room_id, sid),
+                ).fetchone()
+                if carried_over is None:
                     raise ApiError(
                         422, "student_not_allowed",
-                        f"学员 {sid} 不能去考场 {room_id}，整批拒收",
+                        f"学员 {sid} 不能去考场 {room_id}（未恢复该场资格），"
+                        f"整批拒收",
                     )
 
-        # 3) 本批影响面：所有可去本批任一考场的学员（只重核这些人）
+        # 3) 本批影响面：可去本批任一考场，或已在本批考场上一版签到册在册的
+        #    学员（改派离开的学员若保留在上一版，也必须随换册重核）。
         placeholders = ",".join("?" for _ in batch_room_ids)
         affected_rows = conn.execute(
-            f"SELECT DISTINCT student_id FROM student_room"
+            f"SELECT student_id FROM student_room"
+            f" WHERE session_id=? AND room_id IN ({placeholders})"
+            f" UNION "
+            f"SELECT student_id FROM roster_entry"
             f" WHERE session_id=? AND room_id IN ({placeholders})",
-            [session_id, *batch_room_ids],
+            [session_id, *batch_room_ids, session_id, *batch_room_ids],
         ).fetchall()
         affected = sorted(r["student_id"] for r in affected_rows)
 
