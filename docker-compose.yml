@@ -1,0 +1,19 @@
+services:
+  api:
+    build: .
+    container_name: absence-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - absence-data:/data
+    environment:
+      ABSENCE_DB_PATH: /data/absence.db
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  absence-data:
